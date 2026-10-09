@@ -1,44 +1,53 @@
-from fastapi import FastAPI, WebSocket, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import json
-from datetime import datetime
 
 app = FastAPI()
-connected_clients = []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AlertPayload(BaseModel):
+    strategy: str
+    asset: str
+    action: str
+    price: float
+    details: str
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+manager = ConnectionManager()
+
+@app.post("/webhook")
+async def receive_alert(alert: AlertPayload):
+    data = alert.dict()
+    await manager.broadcast(json.dumps(data))
+    return {"status": "success", "broadcasted": data}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connected_clients.append(websocket)
+    await manager.connect(websocket)
     try:
         while True:
             await websocket.receive_text()
-    except:
-        connected_clients.remove(websocket)
-
-@app.post("/webhook")
-async def receive_alert(payload: dict):
-    """
-    Expects JSON payload from MT5:
-    {
-        "strategy": "SMT_DIVERGENCE" | "DAILY_WEEKLY_SWEEP" | "LONDON_NY_SWEEP",
-        "asset": "NAS100" or "US500" or "EURUSD",
-        "action": "BUY" | "SELL",
-        "price": 18500.25,
-        "details": "Swept London High during NY session with rejection"
-    }
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    payload["timestamp"] = timestamp
-    
-    print(f"[{timestamp}] Strategy Triggered: {payload}")
-    
-    # Broadcast to all connected tablet dashboards
-    for client in connected_clients:
-        await client.send_json(payload)
-        
-    return {"status": "success", "received": payload}
-
-@app.get("/")
-async def home():
-    return {"status": "Multi-Strategy Trading Webhook Server is Online"}
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
